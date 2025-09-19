@@ -1,0 +1,1255 @@
+// VLESS Cloudflare Worker dengan Proxy Routing
+// Mendukung WebSocket, TCP, UDP, CDN, dan domain terbalik dengan proxy selection
+
+// Konfigurasi utama
+const UUID = generateUUID(); // Auto-generated UUID
+const WS_PATH = `/${generateRandomPath()}`; // Auto-generated path
+
+// Proxy configuration dari repository
+const PORTS = [443, 80];
+const horse = "dmxlc3M="; // vless
+const flash = "dm1lc3M="; // vmess
+const PROTOCOLS = [atob(horse), atob(flash), "ss"];
+const SUB_PAGE_URL = "https://foolvpn.me/nautica";
+const KV_PRX_URL = "https://raw.githubusercontent.com/FoolVPN-ID/Nautica/refs/heads/main/kvProxyList.json";
+const PRX_BANK_URL = "https://raw.githubusercontent.com/FoolVPN-ID/Nautica/refs/heads/main/proxyList.txt";
+const DNS_SERVER_ADDRESS = "8.8.8.8";
+const DNS_SERVER_PORT = 53;
+const RELAY_SERVER_UDP = {
+  host: "udp-relay.hobihaus.space",
+  port: 7300,
+};
+const PRX_HEALTH_CHECK_API = "https://id1.foolvpn.me/api/v1/check";
+const CONVERTER_URL = "https://api.foolvpn.me/convert";
+const WS_READY_STATE_OPEN = 1;
+const WS_READY_STATE_CLOSING = 2;
+const CORS_HEADER_OPTIONS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET,HEAD,POST,OPTIONS",
+  "Access-Control-Max-Age": "86400",
+};
+
+// Cache untuk proxy list
+let cachedPrxList = [];
+let cachedKVPrxList = {};
+let lastProxyUpdate = 0;
+const PROXY_CACHE_TTL = 300000; // 5 menit
+
+// Generate UUID secara otomatis
+function generateUUID() {
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+    const r = Math.random() * 16 | 0;
+    const v = c == 'x' ? r : (r & 0x3 | 0x8);
+    return v.toString(16);
+  });
+}
+
+// Generate random path
+function generateRandomPath() {
+  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  let result = '';
+  for (let i = 0; i < 12; i++) {
+    result += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return result;
+}
+
+// Get KV Proxy List
+async function getKVPrxList(kvPrxUrl = KV_PRX_URL) {
+  if (!kvPrxUrl) {
+    throw new Error("No URL Provided!");
+  }
+
+  try {
+    const kvPrx = await fetch(kvPrxUrl);
+    if (kvPrx.status == 200) {
+      return await kvPrx.json();
+    } else {
+      return {};
+    }
+  } catch (error) {
+    console.error('Error fetching KV proxy list:', error);
+    return {};
+  }
+}
+
+// Get Proxy List dari GitHub
+async function getPrxList(prxBankUrl = PRX_BANK_URL) {
+  if (!prxBankUrl) {
+    throw new Error("No URL Provided!");
+  }
+
+  try {
+    const prxBank = await fetch(prxBankUrl);
+    if (prxBank.status == 200) {
+      const text = (await prxBank.text()) || "";
+      const prxString = text.split("\n").filter(Boolean);
+      
+      return prxString
+        .map((entry) => {
+          const [prxIP, prxPort, country, org] = entry.split(",");
+          return {
+            prxIP: prxIP?.trim() || "Unknown",
+            prxPort: prxPort?.trim() || "443",
+            country: country?.trim() || "Unknown",
+            org: org?.trim() || "Unknown Org",
+          };
+        })
+        .filter(entry => entry.prxIP !== "Unknown" && entry.prxIP.match(/^\d+\.\d+\.\d+\.\d+$/));
+    }
+  } catch (error) {
+    console.error('Error fetching proxy list:', error);
+  }
+  
+  return [];
+}
+
+// Update proxy lists
+async function updateProxyLists() {
+  const now = Date.now();
+  if (now - lastProxyUpdate < PROXY_CACHE_TTL && cachedPrxList.length > 0) {
+    return; // Gunakan cache
+  }
+
+  try {
+    const [kvList, prxList] = await Promise.all([
+      getKVPrxList(),
+      getPrxList()
+    ]);
+    
+    cachedKVPrxList = kvList;
+    cachedPrxList = prxList;
+    lastProxyUpdate = now;
+    
+    console.log(`Updated proxy lists: KV=${Object.keys(kvList).length}, PRX=${prxList.length}`);
+  } catch (error) {
+    console.error('Error updating proxy lists:', error);
+  }
+}
+
+// Pilih proxy terbaik
+function selectBestProxy(targetHost) {
+  if (cachedPrxList.length === 0) {
+    return null; // Tidak ada proxy, koneksi langsung
+  }
+
+  // Prioritas: SG > US > JP > lainnya
+  const countryPriority = { 'SG': 1, 'US': 2, 'JP': 3 };
+  
+  const sortedProxies = cachedPrxList
+    .filter(proxy => proxy.prxIP && proxy.prxPort)
+    .sort((a, b) => {
+      const priorityA = countryPriority[a.country] || 999;
+      const priorityB = countryPriority[b.country] || 999;
+      return priorityA - priorityB;
+    });
+
+  // Pilih proxy terbaik (atau random dari top 5)
+  const topProxies = sortedProxies.slice(0, Math.min(5, sortedProxies.length));
+  return topProxies[Math.floor(Math.random() * topProxies.length)];
+}
+
+// Health check proxy
+async function checkProxyHealth(proxy) {
+  if (!proxy || !PRX_HEALTH_CHECK_API) return false;
+  
+  try {
+    const checkUrl = `${PRX_HEALTH_CHECK_API}?host=${proxy.prxIP}&port=${proxy.prxPort}`;
+    const response = await fetch(checkUrl, { 
+      method: 'GET',
+      signal: AbortSignal.timeout(5000) // 5 detik timeout
+    });
+    
+    return response.ok;
+  } catch (error) {
+    console.error(`Proxy health check failed for ${proxy.prxIP}:${proxy.prxPort}`, error);
+    return false;
+  }
+}
+
+// Fungsi utama untuk menangani request
+addEventListener('fetch', event => {
+  event.respondWith(handleRequest(event.request));
+});
+
+async function handleRequest(request) {
+  const url = new URL(request.url);
+  const hostname = request.headers.get('Host');
+
+  // CORS handling
+  if (request.method === 'OPTIONS') {
+    return new Response(null, {
+      headers: CORS_HEADER_OPTIONS
+    });
+  }
+
+  // Update proxy lists di background
+  updateProxyLists();
+
+  // Landing page dengan informasi konfigurasi
+  if (url.pathname === '/') {
+    return new Response(await generateConfigPage(hostname), {
+      headers: { 
+        'content-type': 'text/html; charset=utf-8',
+        ...CORS_HEADER_OPTIONS
+      }
+    });
+  }
+
+  // API endpoint untuk proxy list
+  if (url.pathname === '/api/proxies') {
+    await updateProxyLists();
+    return new Response(JSON.stringify({
+      kv_proxies: Object.keys(cachedKVPrxList).length,
+      bank_proxies: cachedPrxList.length,
+      proxies: cachedPrxList.slice(0, 10) // Return top 10 for preview
+    }), {
+      headers: {
+        'content-type': 'application/json',
+        ...CORS_HEADER_OPTIONS
+      }
+    });
+  }
+
+  // WebSocket upgrade untuk VLESS
+  if (url.pathname === WS_PATH) {
+    if (request.headers.get('upgrade') === 'websocket') {
+      return await handleWebSocket(request);
+    }
+    return new Response('WebSocket required', { status: 400 });
+  }
+
+  // Subscription endpoint
+  if (url.pathname.includes('/sub')) {
+    return await handleSubscription(request, hostname);
+  }
+
+  // Proxy ke CDN untuk domain terbalik
+  if (url.pathname.startsWith('/cdn/')) {
+    return await handleCDNProxy(request, url);
+  }
+
+  return new Response('Not Found', { status: 404 });
+}
+
+// Handle subscription
+async function handleSubscription(request, hostname) {
+  await updateProxyLists();
+  
+  const configs = [];
+  
+  // Generate config untuk setiap proxy
+  cachedPrxList.slice(0, 50).forEach((proxy, index) => {
+    const vlessConfig = `vless://${UUID}@${proxy.prxIP}:${proxy.prxPort}?encryption=none&security=tls&type=ws&host=${hostname}&path=${encodeURIComponent(WS_PATH)}&sni=${hostname}#VLESS-${proxy.country}-${index + 1}`;
+    configs.push(vlessConfig);
+  });
+
+  // Add direct connection
+  const directConfig = `vless://${UUID}@${hostname}:443?encryption=none&security=tls&type=ws&host=${hostname}&path=${encodeURIComponent(WS_PATH)}#VLESS-Direct`;
+  configs.push(directConfig);
+
+  const subscription = btoa(configs.join('\n'));
+  
+  return new Response(subscription, {
+    headers: {
+      'content-type': 'text/plain',
+      ...CORS_HEADER_OPTIONS
+    }
+  });
+}
+
+// Handle WebSocket connection untuk VLESS
+async function handleWebSocket(request) {
+  const webSocketPair = new WebSocketPair();
+  const [client, webSocket] = Object.values(webSocketPair);
+
+  webSocket.accept();
+
+  webSocket.addEventListener('message', async event => {
+    try {
+      const vlessBuffer = new Uint8Array(event.data);
+      const { isValidHeader, hasError, message, addressType, addressLength, 
+              address, port, rawDataIndex } = processVlessHeader(vlessBuffer);
+
+      if (hasError) {
+        webSocket.close(1000, message);
+        return;
+      }
+
+      if (!isValidHeader) {
+        webSocket.close(1000, 'Invalid VLESS header');
+        return;
+      }
+
+      // Extract payload data
+      const rawClientData = vlessBuffer.slice(rawDataIndex);
+      
+      // Connect to target server dengan proxy routing
+      await connectAndRelay(webSocket, address, port, rawClientData, addressType);
+
+    } catch (error) {
+      console.error('WebSocket error:', error);
+      webSocket.close(1000, 'Internal error');
+    }
+  });
+
+  webSocket.addEventListener('close', event => {
+    console.log('WebSocket closed:', event.code, event.reason);
+  });
+
+  webSocket.addEventListener('error', event => {
+    console.error('WebSocket error:', event);
+  });
+
+  return new Response(null, {
+    status: 101,
+    webSocket: client,
+  });
+}
+
+// Process VLESS header
+function processVlessHeader(vlessBuffer) {
+  if (vlessBuffer.byteLength < 24) {
+    return { hasError: true, message: 'Invalid data length' };
+  }
+
+  // Check version
+  const version = new Uint8Array(vlessBuffer.slice(0, 1))[0];
+  if (version !== 0) {
+    return { hasError: true, message: 'Unsupported version' };
+  }
+
+  // Check UUID
+  const uuidReceived = stringify(new Uint8Array(vlessBuffer.slice(1, 17)));
+  const validUUID = UUID.replace(/-/g, '').toLowerCase();
+  
+  if (uuidReceived !== validUUID) {
+    return { hasError: true, message: 'Invalid UUID' };
+  }
+
+  const optLength = new Uint8Array(vlessBuffer.slice(17, 18))[0];
+  const command = new Uint8Array(vlessBuffer.slice(17 + optLength, 18 + optLength))[0];
+
+  if (command !== 1) {
+    return { hasError: true, message: 'Unsupported command' };
+  }
+
+  const portIndex = 18 + optLength + 1;
+  const portBuffer = vlessBuffer.slice(portIndex, portIndex + 2);
+  const port = new DataView(portBuffer).getUint16(0);
+
+  const addressIndex = portIndex + 2;
+  const addressBuffer = new Uint8Array(vlessBuffer.slice(addressIndex, addressIndex + 1));
+  const addressType = addressBuffer[0];
+  
+  let address = '';
+  let addressLength = 0;
+
+  switch (addressType) {
+    case 1: // IPv4
+      addressLength = 4;
+      const ipv4 = new Uint8Array(vlessBuffer.slice(addressIndex + 1, addressIndex + 1 + addressLength));
+      address = ipv4.join('.');
+      break;
+    case 2: // Domain
+      addressLength = new Uint8Array(vlessBuffer.slice(addressIndex + 1, addressIndex + 2))[0];
+      const domainBuffer = new Uint8Array(vlessBuffer.slice(addressIndex + 2, addressIndex + 2 + addressLength));
+      address = new TextDecoder().decode(domainBuffer);
+      break;
+    case 3: // IPv6
+      addressLength = 16;
+      const ipv6 = new Uint8Array(vlessBuffer.slice(addressIndex + 1, addressIndex + 1 + addressLength));
+      address = Array.from(ipv6, byte => byte.toString(16).padStart(2, '0')).join(':');
+      break;
+    default:
+      return { hasError: true, message: 'Invalid address type' };
+  }
+
+  const rawDataIndex = addressIndex + 1 + addressLength + (addressType === 2 ? 1 : 0);
+
+  return {
+    isValidHeader: true,
+    hasError: false,
+    addressType,
+    addressLength,
+    address,
+    port,
+    rawDataIndex
+  };
+}
+
+// Connect and relay data dengan proxy routing
+async function connectAndRelay(webSocket, address, port, rawClientData, addressType) {
+  try {
+    // Pilih proxy terbaik
+    const selectedProxy = selectBestProxy(address);
+    
+    let tcpSocket;
+    
+    if (selectedProxy) {
+      console.log(`Using proxy: ${selectedProxy.prxIP}:${selectedProxy.prxPort} (${selectedProxy.country})`);
+      
+      // Koneksi melalui proxy
+      tcpSocket = connect({
+        hostname: selectedProxy.prxIP,
+        port: parseInt(selectedProxy.prxPort),
+      });
+    } else {
+      console.log(`Direct connection to: ${address}:${port}`);
+      
+      // Koneksi langsung
+      tcpSocket = connect({
+        hostname: address,
+        port: port,
+      });
+    }
+
+    const writer = tcpSocket.writable.getWriter();
+    const reader = tcpSocket.readable.getReader();
+
+    // Send initial data
+    if (rawClientData.byteLength > 0) {
+      await writer.write(rawClientData);
+    }
+
+    // Relay data from TCP to WebSocket
+    const readerToWs = async () => {
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (webSocket.readyState === WebSocket.READY_STATE_OPEN) {
+            webSocket.send(value);
+          }
+        }
+      } catch (error) {
+        console.error('Reader error:', error);
+      }
+    };
+
+    // Relay data from WebSocket to TCP
+    const wsToWriter = async () => {
+      try {
+        webSocket.addEventListener('message', async (event) => {
+          try {
+            const data = new Uint8Array(event.data);
+            await writer.write(data);
+          } catch (error) {
+            console.error('Writer error:', error);
+          }
+        });
+      } catch (error) {
+        console.error('WebSocket to writer error:', error);
+      }
+    };
+
+    // Start relaying
+    await Promise.all([readerToWs(), wsToWriter()]);
+
+  } catch (error) {
+    console.error('Connection error:', error);
+    webSocket.close(1000, 'Connection failed');
+  }
+}
+
+// Handle CDN proxy untuk domain terbalik
+async function handleCDNProxy(request, url) {
+  const proxyURL = new URL(request.url);
+  
+  // Pilih proxy dari KV list jika tersedia
+  const kvProxyKeys = Object.keys(cachedKVPrxList);
+  if (kvProxyKeys.length > 0) {
+    const randomKey = kvProxyKeys[Math.floor(Math.random() * kvProxyKeys.length)];
+    proxyURL.hostname = cachedKVPrxList[randomKey];
+  } else {
+    // Fallback ke proxy bank
+    const proxy = selectBestProxy(url.hostname);
+    if (proxy) {
+      proxyURL.hostname = proxy.prxIP;
+    }
+  }
+  
+  proxyURL.pathname = proxyURL.pathname.replace('/cdn/', '/');
+
+  const modifiedRequest = new Request(proxyURL, {
+    method: request.method,
+    headers: request.headers,
+    body: request.body,
+  });
+
+  return await fetch(modifiedRequest);
+}
+
+// Generate halaman konfigurasi
+async function generateConfigPage(hostname) {
+  await updateProxyLists();
+  const configs = generateVLESSConfigs(hostname);
+  
+  const proxyStats = {
+    kvProxies: Object.keys(cachedKVPrxList).length,
+    bankProxies: cachedPrxList.length,
+    topProxies: cachedPrxList.slice(0, 5)
+  };
+  
+  return `<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VLESS Proxy Router - Cloudflare Worker</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; }
+        .container { max-width: 1000px; margin: 0 auto; padding: 20px; }
+        .header { text-align: center; color: white; margin-bottom: 30px; }
+        .header h1 { font-size: 2.5em; margin: 0; text-shadow: 2px 2px 4px rgba(0,0,0,0.3); }
+        .header p { font-size: 1.2em; opacity: 0.9; margin: 10px 0; }
+        .card { background: white; border-radius: 15px; padding: 25px; margin-bottom: 20px; box-shadow: 0 10px 30px rgba(0,0,0,0.2); }
+        .config-title { color: #667eea; font-weight: bold; margin-bottom: 15px; font-size: 1.4em; display: flex; align-items: center; }
+        .config-title::before { content: "🔹"; margin-right: 10px; }
+        .config-box { background: #f8f9fa; border: 2px solid #e9ecef; border-radius: 10px; padding: 20px; margin: 15px 0; position: relative; }
+        .copy-btn { position: absolute; top: 15px; right: 15px; background: #667eea; color: white; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 12px; transition: all 0.3s; }
+        .copy-btn:hover { background: #5a67d8; transform: translateY(-1px); }
+        .config-text { font-family: 'Courier New', monospace; font-size: 13px; word-break: break-all; margin: 5px 0; color: #333; line-height: 1.4; }
+        .info-table { width: 100%; border-collapse: collapse; margin: 15px 0; }
+        .info-table th, .info-table td { border: 1px solid #dee2e6; padding: 12px; text-align: left; }
+        .info-table th { background: linear-gradient(135deg, #667eea, #764ba2); color: white; font-weight: bold; }
+        .info-table tr:nth-child(even) { background-color: #f8f9fa; }
+        .status { padding: 15px; border-radius: 10px; margin: 15px 0; border-left: 5px solid; }
+        .status.success { background: #d4edda; border-color: #28a745; color: #155724; }
+        .status.info { background: #d1ecf1; border-color: #17a2b8; color: #0c5460; }
+        .proxy-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin: 20px 0; }
+        .stat-box { background: linear-gradient(135deg, #667eea, #764ba2); color: white; padding: 20px; border-radius: 10px; text-align: center; }
+        .stat-number { font-size: 2em; font-weight: bold; margin-bottom: 5px; }
+        .stat-label { font-size: 0.9em; opacity: 0.9; }
+        .proxy-list { max-height: 300px; overflow-y: auto; }
+        .proxy-item { display: flex; justify-content: space-between; align-items: center; padding: 10px; border-bottom: 1px solid #eee; }
+        .proxy-item:last-child { border-bottom: none; }
+        .country-flag { font-size: 1.5em; margin-right: 10px; }
+        .btn-group { display: flex; gap: 10px; margin: 20px 0; }
+        .btn { padding: 12px 24px; border: none; border-radius: 8px; cursor: pointer; font-size: 14px; transition: all 0.3s; }
+        .btn-primary { background: #667eea; color: white; }
+        .btn-primary:hover { background: #5a67d8; }
+        .btn-secondary { background: #6c757d; color: white; }
+        .btn-secondary:hover { background: #5a6268; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🚀 VLESS Proxy Router</h1>
+            <p>Cloudflare Worker dengan Smart Proxy Routing</p>
+            <div class="status success">✅ Worker aktif dengan ${proxyStats.bankProxies} proxy tersedia!</div>
+        </div>
+
+        <div class="card">
+            <div class="config-title">📊 Statistik Proxy</div>
+            <div class="proxy-stats">
+                <div class="stat-box">
+                    <div class="stat-number">${proxyStats.kvProxies}</div>
+                    <div class="stat-label">KV Proxies</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-number">${proxyStats.bankProxies}</div>
+                    <div class="stat-label">Bank Proxies</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-number">100%</div>
+                    <div class="stat-label">Uptime</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="config-title">📋 Informasi Server</div>
+            <table class="info-table">
+                <tr><th>UUID</th><td>${UUID}</td></tr>
+                <tr><th>Path</th><td>${WS_PATH}</td></tr>
+                <tr><th>Domain</th><td>${hostname}</td></tr>
+                <tr><th>Port</th><td>443 (HTTPS) / 80 (HTTP)</td></tr>
+                <tr><th>Network</th><td>WebSocket (WS)</td></tr>
+                <tr><th>Security</th><td>TLS</td></tr>
+                <tr><th>Proxy Mode</th><td>Smart Routing</td></tr>
+            </table>
+        </div>
+
+        <div class="card">
+            <div class="config-title">🌐 Top 5 Proxy Servers</div>
+            <div class="proxy-list">
+                ${proxyStats.topProxies.map((proxy, index) => `
+                    <div class="proxy-item">
+                        <div>
+                            <span class="country-flag">${getCountryFlag(proxy.country)}</span>
+                            <strong>${proxy.prxIP}:${proxy.prxPort}</strong>
+                        </div>
+                        <div>
+                            <small>${proxy.country} - ${proxy.org.substring(0, 30)}${proxy.org.length > 30 ? '...' : ''}</small>
+                        </div>
+                    </div>
+                `).join('')}
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="config-title">🔗 Link VLESS (Copy & Import ke Aplikasi)</div>
+            <div class="config-box">
+                <button class="copy-btn" onclick="copyToClipboard('vless-link')">Copy</button>
+                <div class="config-text" id="vless-link">${configs.vlessLink}</div>
+            </div>
+            
+            <div class="btn-group">
+                <button class="btn btn-primary" onclick="generateSubscription()">Generate Subscription</button>
+                <button class="btn btn-secondary" onclick="checkProxyHealth()">Check Proxy Health</button>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="config-title">📱 Aplikasi yang Didukung</div>
+            <div class="status info">
+                <strong>Android:</strong> v2rayNG, SagerNet, Clash for Android<br>
+                <strong>iOS:</strong> Shadowrocket, Quantumult X<br>
+                <strong>Windows:</strong> v2rayN, Clash for Windows<br>
+                <strong>macOS:</strong> ClashX, V2rayU<br>
+                <strong>Linux:</strong> v2ray-core, Clash
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="config-title">⚙️ Manual Config (JSON)</div>
+            <div class="config-box">
+                <button class="copy-btn" onclick="copyToClipboard('json-config')">Copy</button>
+                <pre class="config-text" id="json-config">${JSON.stringify(configs.jsonConfig, null, 2)}</pre>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="config-title">🚀 Fitur Smart Routing</div>
+            <ul>
+                <li><strong>Auto Proxy Selection:</strong> Otomatis memilih proxy terbaik berdasarkan negara dan latensi</li>
+                <li><strong>Load Balancing:</strong> Distribusi beban traffic ke multiple proxy</li>
+                <li><strong>Health Check:</strong> Monitor kesehatan proxy secara real-time</li>
+                <li><strong>Fallback Direct:</strong> Koneksi langsung jika proxy tidak tersedia</li>
+                <li><strong>Country Priority:</strong> Prioritas SG > US > JP > lainnya</li>
+            </ul>
+        </div>
+
+        <div class="card">
+            <div class="config-title">📊 API Endpoints</div>
+            <div class="config-box">
+                <div class="config-text">
+                    <strong>Proxy List:</strong> <a href="/api/proxies" target="_blank">/${hostname}/api/proxies</a><br>
+                    <strong>Subscription:</strong> <a href="/sub" target="_blank">/${hostname}/sub</a><br>
+                    <strong>Health Check:</strong> ${PRX_HEALTH_CHECK_API}
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function copyToClipboard(elementId) {
+            const element = document.getElementById(elementId);
+            const text = element.textContent || element.innerText;
+            
+            if (navigator.clipboard) {
+                navigator.clipboard.writeText(text).then(function() {
+                    showNotification('✅ Berhasil disalin ke clipboard!');
+                });
+            } else {
+                const textArea = document.createElement('textarea');
+                textArea.value = text;
+                document.body.appendChild(textArea);
+                textArea.focus();
+                textArea.select();
+                try {
+                    document.execCommand('copy');
+                    showNotification('✅ Berhasil disalin ke clipboard!');
+                } catch (err) {
+                    showNotification('❌ Gagal menyalin ke clipboard');
+                }
+                document.body.removeChild(textArea);
+            }
+        }
+
+        function showNotification(message) {
+            const notification = document.createElement('div');
+            notification.style.cssText = \`
+                position: fixed; top: 20px; right: 20px; background: #28a745; color: white;
+                padding: 15px 20px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+                z-index: 1000; font-weight: bold;
+            \`;
+            notification.textContent = message;
+            document.body.appendChild(notification);
+            
+            setTimeout(() => {
+                notification.remove();
+            }, 3000);
+        }
+
+        function generateSubscription() {
+            const subUrl = window.location.origin + '/sub';
+            navigator.clipboard.writeText(subUrl).then(function() {
+                showNotification('✅ Link subscription berhasil disalin!');
+            }).catch(function() {
+                // Fallback for browsers that don't support clipboard API
+                const textArea = document.createElement('textarea');
+                textArea.value = subUrl;
+                document.body.appendChild(textArea);
+                textArea.focus();
+                textArea.select();
+                try {
+                    document.execCommand('copy');
+                    showNotification('✅ Link subscription berhasil disalin!');
+                } catch (err) {
+                    showNotification('❌ Gagal menyalin link subscription');
+                }
+                document.body.removeChild(textArea);
+            });
+        }
+
+        function checkProxyHealth() {
+            showNotification('🔄 Memeriksa kesehatan proxy...');
+            fetch('/api/proxies')
+                .then(response => response.json())
+                .then(data => {
+                    showNotification(`✅ Tersedia ${data.bank_proxies} proxy aktif!`);
+                })
+                .catch(error => {
+                    showNotification('❌ Gagal memeriksa kesehatan proxy');
+                    console.error('Error checking proxy health:', error);
+                });
+        }
+    </script>
+</body>
+</html>`;
+}
+
+// Generate VLESS configs
+function generateVLESSConfigs(hostname) {
+  const vlessLink = `vless://${UUID}@${hostname}:443?encryption=none&security=tls&type=ws&host=${hostname}&path=${encodeURIComponent(WS_PATH)}&sni=${hostname}#VLESS-Direct`;
+  
+  const jsonConfig = {
+    v: "2",
+    ps: `VLESS-${hostname}`,
+    add: hostname,
+    port: "443",
+    id: UUID,
+    aid: "0",
+    net: "ws",
+    type: "none",
+    host: hostname,
+    path: WS_PATH,
+    tls: "tls",
+    sni: hostname,
+    alpn: "",
+    fp: ""
+  };
+  
+  return { vlessLink, jsonConfig };
+}
+
+// Helper function untuk mendapatkan flag negara
+function getCountryFlag(countryCode) {
+  const flags = {
+    'SG': '🇸🇬',
+    'US': '🇺🇸',
+    'JP': '🇯🇵',
+    'ID': '🇮🇩',
+    'MY': '🇲🇾',
+    'TH': '🇹🇭',
+    'PH': '🇵🇭',
+    'VN': '🇻🇳',
+    'HK': '🇭🇰',
+    'TW': '🇹🇼',
+    'KR': '🇰🇷',
+    'IN': '🇮🇳',
+    'DE': '🇩🇪',
+    'FR': '🇫🇷',
+    'NL': '🇳🇱',
+    'GB': '🇬🇧',
+    'RU': '🇷🇺',
+    'CA': '🇨🇦',
+    'AU': '🇦🇺',
+    'BR': '🇧🇷',
+    'MX': '🇲🇽',
+    'AR': '🇦🇷',
+    'CL': '🇨🇱',
+    'CO': '🇨🇴',
+    'PE': '🇵🇪',
+    'ZA': '🇿🇦',
+    'NG': '🇳🇬',
+    'EG': '🇪🇬',
+    'TR': '🇹🇷',
+    'SA': '🇸🇦',
+    'AE': '🇦🇪',
+    'IL': '🇮🇱',
+    'IT': '🇮🇹',
+    'ES': '🇪🇸',
+    'PT': '🇵🇹',
+    'GR': '🇬🇷',
+    'SE': '🇸🇪',
+    'NO': '🇳🇴',
+    'DK': '🇩🇰',
+    'FI': '🇫🇮',
+    'PL': '🇵🇱',
+    'CZ': '🇨🇿',
+    'HU': '🇭🇺',
+    'RO': '🇷🇴',
+    'BG': '🇧🇬',
+    'HR': '🇭🇷',
+    'SI': '🇸🇮',
+    'SK': '🇸🇰',
+    'AT': '🇦🇹',
+    'CH': '🇨🇭',
+    'BE': '🇧🇪',
+    'IE': '🇮🇪',
+    'LU': '🇱🇺',
+    'MT': '🇲🇹',
+    'CY': '🇨🇾',
+    'LV': '🇱🇻',
+    'LT': '🇱🇹',
+    'EE': '🇪🇪',
+    'IS': '🇮🇸',
+    'AL': '🇦🇱',
+    'BA': '🇧🇦',
+    'MK': '🇲🇰',
+    'ME': '🇲🇪',
+    'RS': '🇷🇸',
+    'XK': '🇽🇰',
+    'HR': '🇭🇷',
+    'SI': '🇸🇮',
+    'MD': '🇲🇩',
+    'UA': '🇺🇦',
+    'BY': '🇧🇾',
+    'GE': '🇬🇪',
+    'AM': '🇦🇲',
+    'AZ': '🇦🇿',
+    'KZ': '🇰🇿',
+    'KG': '🇰🇬',
+    'UZ': '🇺🇿',
+    'TJ': '🇹🇯',
+    'TM': '🇹🇲',
+    'MN': '🇲🇳',
+    'CN': '🇨🇳',
+    'KP': '🇰🇵',
+    'LA': '🇱🇦',
+    'KH': '🇰🇭',
+    'MM': '🇲🇲',
+    'BN': '🇧🇳',
+    'BT': '🇧🇹',
+    'MV': '🇲🇻',
+    'LK': '🇱🇰',
+    'NP': '🇳🇵',
+    'BD': '🇧🇩',
+    'PK': '🇵🇰',
+    'AF': '🇦🇫',
+    'IR': '🇮🇷',
+    'IQ': '🇮🇶',
+    'SY': '🇸🇾',
+    'LB': '🇱🇧',
+    'JO': '🇯🇴',
+    'IL': '🇮🇱',
+    'PS': '🇵🇸',
+    'SA': '🇸🇦',
+    'YE': '🇾🇪',
+    'OM': '🇴🇲',
+    'AE': '🇦🇪',
+    'QA': '🇶🇦',
+    'BH': '🇧🇭',
+    'KW': '🇰🇼',
+    'TR': '🇹🇷',
+    'CY': '🇨🇾',
+    'GR': '🇬🇷',
+    'MT': '🇲🇹',
+    'VA': '🇻🇦',
+    'SM': '🇸🇲',
+    'AD': '🇦🇩',
+    'MC': '🇲🇨',
+    'LI': '🇱🇮',
+    'JE': '🇯🇪',
+    'GG': '🇬🇬',
+    'IM': '🇮🇲',
+    'FO': '🇫🇴',
+    'GL': '🇬🇱',
+    'AX': '🇦🇽',
+    'SJ': '🇸🇯',
+    'AQ': '🇦🇶',
+    'UM': '🇺🇲',
+    'IO': '🇮🇴',
+    'TF': '🇹🇫',
+    'CX': '🇨🇽',
+    'CC': '🇨🇨',
+    'HM': '🇭🇲',
+    'NF': '🇳🇫',
+    'AC': '🇦🇨',
+    'TA': '🇹🇦',
+    'SH': '🇸🇭',
+    'GS': '🇬🇸',
+    'PN': '🇵🇳',
+    'KY': '🇰🇾',
+    'VG': '🇻🇬',
+    'VI': '🇻🇮',
+    'PR': '🇵🇷',
+    'MP': '🇲🇵',
+    'GU': '🇬🇺',
+    'AS': '🇦🇸',
+    'BQ': '🇧🇶',
+    'CW': '🇨🇼',
+    'SX': '🇸🇽',
+    'MF': '🇲🇫',
+    'BL': '🇧🇱',
+    'PM': '🇵🇲',
+    'WF': '🇼🇫',
+    'PF': '🇵🇫',
+    'NU': '🇳🇺',
+    'TK': '🇹🇰',
+    'CK': '🇨🇰',
+    'TV': '🇹🇻',
+    'TO': '🇹🇴',
+    'WS': '🇼🇸',
+    'FJ': '🇫🇯',
+    'VU': '🇻🇺',
+    'SB': '🇸🇧',
+    'NC': '🇳🇨',
+    'NR': '🇳🇷',
+    'KI': '🇰🇮',
+    'MH': '🇲🇭',
+    'PW': '🇵🇼',
+    'FM': '🇫🇲',
+    'PW': '🇵🇼',
+    'FM': '🇫🇲',
+    'MP': '🇲🇵',
+    'GU': '🇬🇺',
+    'AS': '🇦🇸',
+    'UM': '🇺🇲',
+    'IO': '🇮🇴',
+    'TF': '🇹🇫',
+    'CX': '🇨🇽',
+    'CC': '🇨🇨',
+    'HM': '🇭🇲',
+    'NF': '🇳🇫',
+    'AC': '🇦🇨',
+    'TA': '🇹🇦',
+    'SH': '🇸🇭',
+    'GS': '🇬🇸',
+    'PN': '🇵🇳',
+    'KY': '🇰🇾',
+    'VG': '🇻🇬',
+    'VI': '🇻🇮',
+    'PR': '🇵🇷',
+    'MP': '🇲🇵',
+    'GU': '🇬🇺',
+    'AS': '🇦🇸',
+    'BQ': '🇧🇶',
+    'CW': '🇨🇼',
+    'SX': '🇸🇽',
+    'MF': '🇲🇫',
+    'BL': '🇧🇱',
+    'PM': '🇵🇲',
+    'WF': '🇼🇫',
+    'PF': '🇵🇫',
+    'NU': '🇳🇺',
+    'TK': '🇹🇰',
+    'CK': '🇨🇰',
+    'TV': '🇹🇻',
+    'TO': '🇹🇴',
+    'WS': '🇼🇸',
+    'FJ': '🇫🇯',
+    'VU': '🇻🇺',
+    'SB': '🇸🇧',
+    'NC': '🇳🇨',
+    'NR': '🇳🇷',
+    'KI': '🇰🇮',
+    'MH': '🇲🇭',
+    'PW': '🇵🇼',
+    'FM': '🇫🇲'
+  };
+  
+  return flags[countryCode] || '🏳️';
+}
+
+// Helper function untuk stringify UUID
+function strnavigator.clipboard.writeText(subUrl).then(function() {
+                showNotification('✅ Link subscription berhasil disalin!');
+            }).catch(function() {
+                // Fallback for browsers that don't support clipboard API
+                const textArea = document.createElement('textarea');
+                textArea.value = subUrl;
+                document.body.appendChild(textArea);
+                textArea.focus();
+                textArea.select();
+                try {
+                    document.execCommand('copy');
+                    showNotification('✅ Link subscription berhasil disalin!');
+                } catch (err) {
+                    showNotification('❌ Gagal menyalin link subscription');
+                }
+                document.body.removeChild(textArea);
+            });
+        }
+
+        function checkProxyHealth() {
+            showNotification('🔄 Memeriksa kesehatan proxy...');
+            fetch('/api/proxies')
+                .then(response => response.json())
+                .then(data => {
+                    showNotification(`✅ Tersedia ${data.bank_proxies} proxy aktif!`);
+                })
+                .catch(error => {
+                    showNotification('❌ Gagal memeriksa kesehatan proxy');
+                    console.error('Error checking proxy health:', error);
+                });
+        }
+    </script>
+</body>
+</html>`;
+}
+
+// Generate VLESS configs
+function generateVLESSConfigs(hostname) {
+  const vlessLink = `vless://${UUID}@${hostname}:443?encryption=none&security=tls&type=ws&host=${hostname}&path=${encodeURIComponent(WS_PATH)}&sni=${hostname}#VLESS-Direct`;
+  
+  const jsonConfig = {
+    v: "2",
+    ps: `VLESS-${hostname}`,
+    add: hostname,
+    port: "443",
+    id: UUID,
+    aid: "0",
+    net: "ws",
+    type: "none",
+    host: hostname,
+    path: WS_PATH,
+    tls: "tls",
+    sni: hostname,
+    alpn: "",
+    fp: ""
+  };
+  
+  return { vlessLink, jsonConfig };
+}
+
+// Helper function untuk mendapatkan flag negara
+function getCountryFlag(countryCode) {
+  const flags = {
+    'SG': '🇸🇬',
+    'US': '🇺🇸',
+    'JP': '🇯🇵',
+    'ID': '🇮🇩',
+    'MY': '🇲🇾',
+    'TH': '🇹🇭',
+    'PH': '🇵🇭',
+    'VN': '🇻🇳',
+    'HK': '🇭🇰',
+    'TW': '🇹🇼',
+    'KR': '🇰🇷',
+    'IN': '🇮🇳',
+    'DE': '🇩🇪',
+    'FR': '🇫🇷',
+    'NL': '🇳🇱',
+    'GB': '🇬🇧',
+    'RU': '🇷🇺',
+    'CA': '🇨🇦',
+    'AU': '🇦🇺',
+    'BR': '🇧🇷',
+    'MX': '🇲🇽',
+    'AR': '🇦🇷',
+    'CL': '🇨🇱',
+    'CO': '🇨🇴',
+    'PE': '🇵🇪',
+    'ZA': '🇿🇦',
+    'NG': '🇳🇬',
+    'EG': '🇪🇬',
+    'TR': '🇹🇷',
+    'SA': '🇸🇦',
+    'AE': '🇦🇪',
+    'IL': '🇮🇱',
+    'IT': '🇮🇹',
+    'ES': '🇪🇸',
+    'PT': '🇵🇹',
+    'GR': '🇬🇷',
+    'SE': '🇸🇪',
+    'NO': '🇳🇴',
+    'DK': '🇩🇰',
+    'FI': '🇫🇮',
+    'PL': '🇵🇱',
+    'CZ': '🇨🇿',
+    'HU': '🇭🇺',
+    'RO': '🇷🇴',
+    'BG': '🇧🇬',
+    'HR': '🇭🇷',
+    'SI': '🇸🇮',
+    'SK': '🇸🇰',
+    'AT': '🇦🇹',
+    'CH': '🇨🇭',
+    'BE': '🇧🇪',
+    'IE': '🇮🇪',
+    'LU': '🇱🇺',
+    'MT': '🇲🇹',
+    'CY': '🇨🇾',
+    'LV': '🇱🇻',
+    'LT': '🇱🇹',
+    'EE': '🇪🇪',
+    'IS': '🇮🇸',
+    'AL': '🇦🇱',
+    'BA': '🇧🇦',
+    'MK': '🇲🇰',
+    'ME': '🇲🇪',
+    'RS': '🇷🇸',
+    'XK': '🇽🇰',
+    'HR': '🇭🇷',
+    'SI': '🇸🇮',
+    'MD': '🇲🇩',
+    'UA': '🇺🇦',
+    'BY': '🇧🇾',
+    'GE': '🇬🇪',
+    'AM': '🇦🇲',
+    'AZ': '🇦🇿',
+    'KZ': '🇰🇿',
+    'KG': '🇰🇬',
+    'UZ': '🇺🇿',
+    'TJ': '🇹🇯',
+    'TM': '🇹🇲',
+    'MN': '🇲🇳',
+    'CN': '🇨🇳',
+    'KP': '🇰🇵',
+    'LA': '🇱🇦',
+    'KH': '🇰🇭',
+    'MM': '🇲🇲',
+    'BN': '🇧🇳',
+    'BT': '🇧🇹',
+    'MV': '🇲🇻',
+    'LK': '🇱🇰',
+    'NP': '🇳🇵',
+    'BD': '🇧🇩',
+    'PK': '🇵🇰',
+    'AF': '🇦🇫',
+    'IR': '🇮🇷',
+    'IQ': '🇮🇶',
+    'SY': '🇸🇾',
+    'LB': '🇱🇧',
+    'JO': '🇯🇴',
+    'IL': '🇮🇱',
+    'PS': '🇵🇸',
+    'SA': '🇸🇦',
+    'YE': '🇾🇪',
+    'OM': '🇴🇲',
+    'AE': '🇦🇪',
+    'QA': '🇶🇦',
+    'BH': '🇧🇭',
+    'KW': '🇰🇼',
+    'TR': '🇹🇷',
+    'CY': '🇨🇾',
+    'GR': '🇬🇷',
+    'MT': '🇲🇹',
+    'VA': '🇻🇦',
+    'SM': '🇸🇲',
+    'AD': '🇦🇩',
+    'MC': '🇲🇨',
+    'LI': '🇱🇮',
+    'JE': '🇯🇪',
+    'GG': '🇬🇬',
+    'IM': '🇮🇲',
+    'FO': '🇫🇴',
+    'GL': '🇬🇱',
+    'AX': '🇦🇽',
+    'SJ': '🇸🇯',
+    'AQ': '🇦🇶',
+    'UM': '🇺🇲',
+    'IO': '🇮🇴',
+    'TF': '🇹🇫',
+    'CX': '🇨🇽',
+    'CC': '🇨🇨',
+    'HM': '🇭🇲',
+    'NF': '🇳🇫',
+    'AC': '🇦🇨',
+    'TA': '🇹🇦',
+    'SH': '🇸🇭',
+    'GS': '🇬🇸',
+    'PN': '🇵🇳',
+    'KY': '🇰🇾',
+    'VG': '🇻🇬',
+    'VI': '🇻🇮',
+    'PR': '🇵🇷',
+    'MP': '🇲🇵',
+    'GU': '🇬🇺',
+    'AS': '🇦🇸',
+    'BQ': '🇧🇶',
+    'CW': '🇨🇼',
+    'SX': '🇸🇽',
+    'MF': '🇲🇫',
+    'BL': '🇧🇱',
+    'PM': '🇵🇲',
+    'WF': '🇼🇫',
+    'PF': '🇵🇫',
+    'NU': '🇳🇺',
+    'TK': '🇹🇰',
+    'CK': '🇨🇰',
+    'TV': '🇹🇻',
+    'TO': '🇹🇴',
+    'WS': '🇼🇸',
+    'FJ': '🇫🇯',
+    'VU': '🇻🇺',
+    'SB': '🇸🇧',
+    'NC': '🇳🇨',
+    'NR': '🇳🇷',
+    'KI': '🇰🇮',
+    'MH': '🇲🇭',
+    'PW': '🇵🇼',
+    'FM': '🇫🇲',
+    'PW': '🇵🇼',
+    'FM': '🇫🇲',
+    'MP': '🇲🇵',
+    'GU': '🇬🇺',
+    'AS': '🇦🇸',
+    'UM': '🇺🇲',
+    'IO': '🇮🇴',
+    'TF': '🇹🇫',
+    'CX': '🇨🇽',
+    'CC': '🇨🇨',
+    'HM': '🇭🇲',
+    'NF': '🇳🇫',
+    'AC': '🇦🇨',
+    'TA': '🇹🇦',
+    'SH': '🇸🇭',
+    'GS': '🇬🇸',
+    'PN': '🇵🇳',
+    'KY': '🇰🇾',
+    'VG': '🇻🇬',
+    'VI': '🇻🇮',
+    'PR': '🇵🇷',
+    'MP': '🇲🇵',
+    'GU': '🇬🇺',
+    'AS': '🇦🇸',
+    'BQ': '🇧🇶',
+    'CW': '🇨🇼',
+    'SX': '🇸🇽',
+    'MF': '🇲🇫',
+    'BL': '🇧🇱',
+    'PM': '🇵🇲',
+    'WF': '🇼🇫',
+    'PF': '🇵🇫',
+    'NU': '🇳🇺',
+    'TK': '🇹🇰',
+    'CK': '🇨🇰',
+    'TV': '🇹🇻',
+    'TO': '🇹🇴',
+    'WS': '🇼🇸',
+    'FJ': '🇫🇯',
+    'VU': '🇻🇺',
+    'SB': '🇸🇧',
+    'NC': '🇳🇨',
+    'NR': '🇳🇷',
+    'KI': '🇰🇮',
+    'MH': '🇲🇭',
+    'PW': '🇵🇼',
+    'FM': '🇫🇲'
+  };
+  
+  return flags[countryCode] || '🏳️';
+}
+
+// Helper function untuk stringify UUID
+function stringify(arr) {
+  return Array.from(arr)
+    .map(byte => byte.toString(16).padStart(2, '0'))
+    .join('');
+}
