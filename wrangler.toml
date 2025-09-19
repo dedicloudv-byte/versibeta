@@ -1,5 +1,5 @@
 name = "vless-worker-cdn"
-main = "src/index.js"
+main = "sumber/index.js"
 compatibility_date = "2023-12-01"
 
 [vars]
