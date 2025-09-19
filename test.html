@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>VLESS Worker Test</title>
+<script src="https://sites.super.myninja.ai/_assets/ninja-daytona-script.js"></script>
+</head>
+<body>
+    <h1>VLESS Worker Test Page</h1>
+    <button onclick="testHealthCheck()">Test Health Check</button>
+    <button onclick="testVLESSCreation()">Test VLESS Creation</button>
+    <div id="results"></div>
+
+    <script>
+        async function testHealthCheck() {
+            const results = document.getElementById('results');
+            results.innerHTML = 'Testing proxy health...';
+            
+            try {
+                const response = await fetch('/api/check-proxy', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ proxy: '1.1.1.1', port: 443 })
+                });
+                
+                const data = await response.json();
+                results.innerHTML = '<pre>' + JSON.stringify(data, null, 2) + '</pre>';
+            } catch (error) {
+                results.innerHTML = 'Error: ' + error.message;
+            }
+        }
+
+        async function testVLESSCreation() {
+            const results = document.getElementById('results');
+            results.innerHTML = 'Creating VLESS config...';
+            
+            try {
+                const response = await fetch('/api/create-vless', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        proxy: '104.16.123.45',
+                        port: 443,
+                        serverName: 'www.cloudflare.com',
+                        network: 'ws',
+                        path: '/vless',
+                        security: 'tls'
+                    })
+                });
+                
+                const data = await response.json();
+                results.innerHTML = '<pre>' + JSON.stringify(data, null, 2) + '</pre>';
+            } catch (error) {
+                results.innerHTML = 'Error: ' + error.message;
+            }
+        }
+    </script>
+</body>
+</html>

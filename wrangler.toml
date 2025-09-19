@@ -1,0 +1,11 @@
+name = "vless-worker-cdn"
+main = "src/index.js"
+compatibility_date = "2023-12-01"
+
+[vars]
+ENVIRONMENT = "production"
+
+[[kv_namespaces]]
+binding = "VLESS_CONFIGS"
+id = "your-kv-namespace-id"
+preview_id = "your-kv-preview-id"
