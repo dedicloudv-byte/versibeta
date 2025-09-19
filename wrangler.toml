@@ -7,5 +7,5 @@ ENVIRONMENT = "production"
 
 [[kv_namespaces]]
 binding = "VLESS_CONFIGS"
-id = "your-kv-namespace-id"
-preview_id = "your-kv-preview-id"
+id = "26ae405edc964320a2b2da512fbb1eb9"
+preview_id = "VLESS_CONFIGS"
